@@ -619,7 +619,8 @@ def main_page():
 
     # Define holder for late-binding UI refresh functions
     ui_callbacks = {
-        "refresh_details": lambda: None
+        "refresh_details": lambda: None,
+        "refresh_tags_ui": lambda: None
     }
 
     def show_full_image(f_path):
@@ -1293,6 +1294,7 @@ def main_page():
                     state.config["custom_quick_tags"].append(t)
                     state.save_config()
                     refresh_quick_tags()
+                    ui_callbacks["refresh_tags_ui"]()
                     ui.notify("已添加到常用列表")
             ui.button('保存预设', icon='save', on_click=save_custom_tag_setting).classes(BTN_SECONDARY)
             
@@ -2099,6 +2101,8 @@ def main_page():
                                         with ui.row().classes('items-center bg-white border rounded px-3 py-1 gap-2 shadow-sm'):
                                             ui.label(t).classes('text-sm font-medium')
                                             ui.icon('close', size='xs').classes('cursor-pointer text-red-500 hover:text-red-700').on('click', remove_tag_wrapper)
+                            
+                            ui_callbacks["refresh_tags_ui"] = refresh_tags_ui
                             refresh_tags_ui()
 
     # --- 逻辑绑定 ---
