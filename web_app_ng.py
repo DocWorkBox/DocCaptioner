@@ -2,6 +2,15 @@ import psutil
 import subprocess
 import os
 import platform
+import sys
+
+# Print startup banner (English to avoid encoding issues)
+print("-" * 50)
+print("Initializing DocCaptioner System...")
+print("Loading dependencies (NiceGUI, PyTorch, Transformers)...")
+print("First launch may take some time, please wait...")
+print("-" * 50)
+
 import json
 import asyncio
 import threading
@@ -856,6 +865,17 @@ def main_page():
         if not state.selected_files: return
         for f in list(state.selected_files):
             try:
+                # Cleanup thumbnail
+                try:
+                    if os.path.exists(f):
+                        mtime = os.path.getmtime(f)
+                        hash_str = f"{f}_{mtime}"
+                        thumb_name = hashlib.md5(hash_str.encode('utf-8')).hexdigest() + ".jpg"
+                        thumb_path = os.path.join(THUMB_DIR, thumb_name)
+                        if os.path.exists(thumb_path):
+                            os.remove(thumb_path)
+                except: pass
+
                 os.remove(f)
                 txt = get_caption_path(f)
                 if os.path.exists(txt): os.remove(txt)
@@ -1902,6 +1922,21 @@ def main_page():
                                             try:
                                                 target_path = os.path.join(DATASET_ROOT, dataset_to_delete)
                                                 if os.path.exists(target_path):
+                                                    # Cleanup thumbnails
+                                                    try:
+                                                        for root, dirs, files in os.walk(target_path):
+                                                            for f in files:
+                                                                try:
+                                                                    full_path = os.path.join(root, f)
+                                                                    mtime = os.path.getmtime(full_path)
+                                                                    hash_str = f"{full_path}_{mtime}"
+                                                                    thumb_name = hashlib.md5(hash_str.encode('utf-8')).hexdigest() + ".jpg"
+                                                                    thumb_path = os.path.join(THUMB_DIR, thumb_name)
+                                                                    if os.path.exists(thumb_path):
+                                                                        os.remove(thumb_path)
+                                                                except: pass
+                                                    except: pass
+
                                                     shutil.rmtree(target_path)
                                                     ui.notify(f"已删除: {dataset_to_delete}")
                                                 else:
