@@ -1,0 +1,11 @@
+nicegui
+transformers>=4.45.0
+accelerate
+pillow
+opencv-python
+qwen-vl-utils
+piexif
+huggingface_hub
+llama-cpp-python
+requests
+openai
