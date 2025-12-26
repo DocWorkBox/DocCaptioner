@@ -48,7 +48,7 @@
 克隆仓库并运行安装脚本：
 
 ```cmd
-git clone https://github.com/ArchAngelAries/DocCaptioner.git
+git clone https://github.com/DocWorkBox/DocCaptioner.git
 cd DocCaptioner
 install.bat
 ```
