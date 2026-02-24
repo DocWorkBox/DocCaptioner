@@ -3,6 +3,11 @@ import subprocess
 import os
 import platform
 import sys
+import warnings
+
+# 忽略 bitsandbytes 的 MatMul8bitLt 警告 (已知无害且无法消除)
+warnings.filterwarnings("ignore", message="MatMul8bitLt: inputs will be cast")
+warnings.filterwarnings("ignore", module="bitsandbytes.autograd._functions")
 
 # Print startup banner (English to avoid encoding issues)
 print("-" * 50)
@@ -33,11 +38,12 @@ from fastapi.responses import FileResponse
 # 尝试导入 PyTorch 和 HuggingFace
 try:
     import torch
-    from transformers import AutoProcessor, AutoModelForImageTextToText
+    from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
     from qwen_vl_utils import process_vision_info
     from huggingface_hub import snapshot_download
 except ImportError:
     torch = None
+    BitsAndBytesConfig = None
 
 # 尝试导入 Llama-CPP (GGUF)
 try:
@@ -61,7 +67,8 @@ KNOWN_MODELS = {
         "repo_id": "unsloth/Qwen3-VL-8B-Instruct-1M-GGUF",
         "is_gguf": True,
         "filename": "Qwen3-VL-8B-Instruct-1M-Q8_0.gguf"
-    }
+    },
+    "Huihui-Qwen3-VL-8B-Instruct (Abliterated)": {"repo_id": "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated"}
 }
 
 BASE_QUICK_TAGS = [
@@ -87,8 +94,10 @@ PROMPTS = {
 }
 
 CONFIG_FILE = "config.json"
-DATASET_ROOT = os.path.join(os.getcwd(), "Dataset Collections")
-THUMB_DIR = os.path.join(os.getcwd(), "thumbnails")
+# 使用脚本所在目录作为基准，而不是当前工作目录，确保移动程序后路径正确
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATASET_ROOT = os.path.join(BASE_DIR, "Dataset Collections")
+THUMB_DIR = os.path.join(BASE_DIR, "thumbnails")
 
 if not os.path.exists(DATASET_ROOT):
     os.makedirs(DATASET_ROOT)
@@ -175,6 +184,7 @@ class AppState:
         self.config.setdefault("temperature", 0.7)
         self.config.setdefault("top_p", 0.9)
         self.config.setdefault("unload_model", False)
+        self.config.setdefault("quantization", "None") # Options: None, 4-bit, 8-bit
         self.config.setdefault("custom_quick_tags", [])
         self.config.setdefault("splitter_value", 40)
         self.config.setdefault("show_perf_monitor", False)
@@ -191,7 +201,26 @@ class AppState:
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    config = json.load(f)
+                
+                # 自动修复数据集路径
+                # 当程序被移动位置时，配置文件里的绝对路径可能会失效
+                # 我们尝试在当前 DATASET_ROOT 下寻找同名文件夹
+                current = config.get("current_folder")
+                if current and not os.path.exists(current):
+                    folder_name = os.path.basename(current)
+                    # 尝试在新的 DATASET_ROOT 下寻找
+                    new_path = os.path.join(DATASET_ROOT, folder_name)
+                    if os.path.exists(new_path):
+                        print(f"Auto-fixing dataset path: {current} -> {new_path}")
+                        config["current_folder"] = new_path
+                    elif os.path.exists(DATASET_ROOT):
+                        # 如果找不到同名文件夹，但 DATASET_ROOT 存在，则重置为根目录
+                        # 避免因为路径不存在导致程序报错
+                        print(f"Dataset path not found: {current}, resetting to root.")
+                        config["current_folder"] = DATASET_ROOT
+                        
+                return config
             except:
                 pass
         return {}
@@ -365,7 +394,7 @@ class AIWorker(threading.Thread):
                                 # 都不存在，开始下载
                                 state.add_log(f"未检测到完整模型，开始下载: {repo_id}...")
                                 try:
-                                    snapshot_download(repo_id=repo_id, local_dir=std_dir)
+                                    snapshot_download(repo_id=repo_id, local_dir=std_dir, resume_download=True)
                                     model_path = std_dir
                                 except Exception as e:
                                     raise RuntimeError(f"模型下载失败: {e}")
@@ -386,28 +415,157 @@ class AIWorker(threading.Thread):
                         if torch is None: raise RuntimeError("未安装 PyTorch/Transformers")
                         device = "cuda" if torch.cuda.is_available() else "cpu"
                         
+                        # --- 显存/性能优化配置 ---
+                        load_kwargs = {
+                            "trust_remote_code": True,
+                            # 修复 torch_dtype 警告，使用 dtype
+                            "dtype": torch.float16 if device=="cuda" else torch.float32, 
+                        }
+                        
+                        # 提前获取 quant_mode 以供显存计算使用
+                        quant_mode = self.config.get("quantization", "None")
+
+                        if device == "cuda":
+                            # 显存管理策略
+                            use_vram_opt = self.config.get("vram_optimization", False)
+                            
+                            if quant_mode == "None" and use_vram_opt:
+                                # 只有在【非量化模式】且【用户开启显存优化】时，才启用 CPU Offload
+                                try:
+                                    vram_total = torch.cuda.get_device_properties(0).total_memory
+                                    reserve_bytes = max(4 * 1024**3, int(vram_total * 0.3)) # 预留 30% 或 4GB
+                                    limit_bytes = vram_total - reserve_bytes
+                                    limit_gib = limit_bytes / (1024**3)
+                                    
+                                    load_kwargs["device_map"] = "auto"
+                                    load_kwargs["max_memory"] = {0: limit_bytes, "cpu": "256GiB"}
+                                    state.add_log(f"显存优化: 限制使用 {limit_gib:.2f}GiB (预留 {reserve_bytes/(1024**3):.2f}GiB), 剩余部分 Offload 到 CPU")
+                                except Exception as e:
+                                    state.add_log(f"显存优化设置失败: {e}，将使用全量模式")
+                                    load_kwargs["device_map"] = "cuda"
+                            else:
+                                # 量化模式或用户未开启优化 -> 全量 GPU 模式
+                                load_kwargs["device_map"] = "cuda"
+                                if quant_mode != "None":
+                                     state.add_log(f"显存优化: 量化模式下已自动禁用 (优先兼容性)")
+                                else:
+                                     state.add_log(f"显存优化: 未启用 (全量 GPU 模式)")
+                        else:
+                            load_kwargs["device_map"] = "cpu"
+
+                        # 1. Quantization (4-bit / 8-bit)
+                        # quant_mode = self.config.get("quantization", "None") # 已在上方定义
+                        if device == "cuda" and quant_mode != "None" and BitsAndBytesConfig:
+                            # 检查 bitsandbytes 是否可用
+                            try:
+                                import bitsandbytes as bnb
+                                if quant_mode == "4-bit":
+                                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                                        load_in_4bit=True,
+                                        bnb_4bit_compute_dtype=torch.float16,
+                                        bnb_4bit_use_double_quant=True,
+                                        bnb_4bit_quant_type="nf4",
+                                        # llm_int8_skip_modules=["visual", "vision_model", "lm_head"], # 移除跳过，回归原始
+                                    )
+                                    state.add_log("启用 4-bit 量化 (NF4)")
+                                elif quant_mode == "8-bit":
+                                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                                        load_in_8bit=True,
+                                        # llm_int8_skip_modules=["visual", "vision_model", "lm_head"], # 移除跳过，回归原始
+                                    )
+                                    state.add_log("启用 8-bit 量化")
+                            except ImportError:
+                                state.add_log("⚠️ Warning: bitsandbytes 未安装，量化功能已禁用，将使用默认精度。")
+                            except Exception as e:
+                                state.add_log(f"⚠️ Warning: bitsandbytes 加载失败: {e}，将使用默认精度。")
+
+                        # 2. Flash Attention 2 (Ampere+ GPUs)
+                        if device == "cuda":
+                            try:
+                                # 检查是否安装了 flash_attn
+                                import importlib.util
+                                has_fa2 = importlib.util.find_spec("flash_attn") is not None
+                                
+                                major, _ = torch.cuda.get_device_capability(0)
+                                if major >= 8 and has_fa2:
+                                    load_kwargs["attn_implementation"] = "flash_attention_2"
+                                    state.add_log("检测到 Ampere+ 显卡且已安装 flash_attn，启用 Flash Attention 2 加速")
+                                elif major >= 8:
+                                    # 有显卡但没包，静默回退或提示
+                                    # load_kwargs["attn_implementation"] = "sdpa" # PyTorch 2.0+ default
+                                    state.add_log("使用 PyTorch 内置 SDPA 加速 (性能接近 Flash Attention)")
+                            except: pass
+
                         # VRAM Safety Check
                         if device == "cuda":
                             vram_total = torch.cuda.get_device_properties(0).total_memory
                             vram_gb = vram_total / (1024**3)
                             state.add_log(f"Detected VRAM: {vram_gb:.1f} GB")
                             
-                            # Simple heuristic: 8B model in FP16 needs ~16GB. If < 16GB, warn or error.
-                            # But we let it try, relying on swap if needed, though that causes freeze.
-                            # Better: Load in 4-bit if possible? We don't have bitsandbytes confirmed.
-                            # Just log warning for now.
-                            if vram_gb < 12 and "8B" in model_path:
-                                state.add_log("⚠️ 警告: 显存可能不足 (<12GB)，建议使用 API 模式或 GGUF 版本")
+                            if vram_gb < 12 and "8B" in model_path and quant_mode == "None":
+                                state.add_log("⚠️ 警告: 显存可能不足 (<12GB)，建议开启 4-bit 量化或使用 GGUF 版本")
 
                         try:
                             processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
                             model = AutoModelForImageTextToText.from_pretrained(
-                                model_path, device_map=device, torch_dtype=torch.float16 if device=="cuda" else torch.float32, trust_remote_code=True
+                                model_path, **load_kwargs
                             ).eval()
-                        except RuntimeError as e:
-                            if "no kernel image is available" in str(e):
+                            
+                            # (已移除) 强制将视觉编码器转换为 float16
+                            # 由于我们已经选择忽略 MatMul8bitLt 警告，且 bitsandbytes 自动转换工作正常
+                            # 移除这段手动转换代码可以减少启动时间并避免潜在副作用
+                                
+                        except Exception as e:
+                            err_str = str(e)
+                            # state.add_log(f"Debug: Model load error: {err_str}") # Optional debug
+
+                            if "no kernel image is available" in err_str:
                                 raise RuntimeError("您的显卡 (RTX 50系列/其他) 与当前 PyTorch 版本不兼容。请使用 API 模式。")
-                            raise e
+                            
+                            # 自动降级重试逻辑
+                            is_bnb_error = "bitsandbytes" in err_str.lower()
+                            is_fa2_error = "flash_attn" in err_str.lower() or "flash attention" in err_str.lower()
+                            is_model_error = "no file named" in err_str or "safetensor" in err_str.lower() or "oserror" in err_str.lower()
+                            
+                            if is_bnb_error or is_fa2_error:
+                                state.add_log(f"⚠️ 优化组件加载失败 ({'BitsAndBytes' if is_bnb_error else 'FlashAttn'}), 正在尝试降级重试...")
+                                
+                                if "quantization_config" in load_kwargs:
+                                    del load_kwargs["quantization_config"]
+                                    state.add_log("- 已禁用量化")
+                                
+                                if "attn_implementation" in load_kwargs:
+                                    del load_kwargs["attn_implementation"]
+                                    state.add_log("- 已禁用 Flash Attention")
+                                
+                                # 重试加载
+                                model = AutoModelForImageTextToText.from_pretrained(
+                                    model_path, **load_kwargs
+                                ).eval()
+                                state.add_log("✅ 降级模式加载成功")
+                            
+                            # 断点续传逻辑 (新增)
+                            elif is_model_error and source_type == "预设模型 (Preset)":
+                                state.add_log(f"⚠️ 检测到模型文件可能损坏或缺失: {e}")
+                                state.add_log("⏳ 正在尝试断点续传/修复模型...")
+                                
+                                try:
+                                    # 重新触发下载
+                                    model_info = KNOWN_MODELS.get(self.config["selected_model_key"])
+                                    repo_id = model_info["repo_id"]
+                                    snapshot_download(repo_id=repo_id, local_dir=model_path, resume_download=True)
+                                    state.add_log("✅ 模型修复完成，正在重新加载...")
+                                    
+                                    # 再次重试加载
+                                    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+                                    model = AutoModelForImageTextToText.from_pretrained(
+                                        model_path, **load_kwargs
+                                    ).eval()
+                                    state.add_log("✅ 模型重新加载成功")
+                                except Exception as download_err:
+                                    raise RuntimeError(f"模型修复失败: {download_err}")
+                            else:
+                                raise e
 
                     state.add_log("模型加载成功")
                 except Exception as e:
@@ -514,6 +672,12 @@ class AIWorker(threading.Thread):
                                 padding=True,
                                 return_tensors="pt"
                             ).to(model.device)
+                            
+                            # 显式转换浮点类型输入到 float16，避免 bitsandbytes 自动转换的性能损耗和警告
+                            if device == "cuda":
+                                for k, v in inputs.items():
+                                    if torch.is_tensor(v) and torch.is_floating_point(v) and v.dtype == torch.float32:
+                                        inputs[k] = v.to(torch.float16)
 
                             # 增加 streamer 以便实时输出（可选），或至少在生成前 log 一下
                             state.add_log(f"开始推理: {fname}...")
@@ -569,14 +733,17 @@ class AIWorker(threading.Thread):
                 
                 # --- Critical: Resource Cleanup & Rate Limiting ---
                 # Force cleanup to prevent VRAM fragmentation/OOM leading to system freeze
-                if torch and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-                gc.collect()
+                # 优化: 减少清理频率，仅当处理一定数量图片后或显存占用过高时清理
+                # 或者仅在推理出错时强制清理
+                if (i + 1) % 5 == 0 or is_vid: # 每 5 张图或遇到视频时清理一次
+                    if torch and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        # torch.cuda.ipc_collect() # 不需要频繁调用
+                    gc.collect()
                 
                 # Sleep briefly to allow system UI/rendering to catch up and GPU to cool down
                 # This prevents "deadlock" feeling on the desktop
-                time.sleep(0.5) 
+                time.sleep(0.1) # 减少等待时间，提升吞吐量 
 
         except Exception as e:
             state.add_log(f"任务异常: {e}")
@@ -609,7 +776,49 @@ app.add_static_files('/datasets', DATASET_ROOT)
 
 @ui.page('/')
 def main_page():
-    ui.page_title('DocCaptioner v1.0')
+    ui.page_title('DocCaptioner v1.1')
+    
+    # 注入移动端响应式样式
+    ui.add_head_html('''
+        <style>
+            @media (max-width: 768px) {
+                /* 强制 Splitter 变为垂直布局 */
+                .responsive-splitter {
+                    flex-direction: column !important;
+                    height: auto !important; /* 让高度自适应内容 */
+                    overflow-y: auto !important; /* 允许页面滚动 */
+                }
+                
+                /* 面板宽度强制 100% */
+                .responsive-splitter .q-splitter__panel {
+                    width: 100% !important;
+                    height: auto !important;
+                }
+                
+                /* 上半部分（画廊）：固定高度，允许内部滚动 */
+                .responsive-splitter .q-splitter__before {
+                    height: 50vh !important;
+                    border-bottom: 4px solid #e5e7eb;
+                }
+                
+                /* 下半部分（功能区）：占满剩余空间或自适应 */
+                .responsive-splitter .q-splitter__after {
+                    min-height: 50vh !important;
+                    height: auto !important;
+                }
+                
+                /* 隐藏原有的分割条 */
+                .responsive-splitter .q-splitter__separator {
+                    display: none !important;
+                }
+                
+                /* 修复 Tabs 在移动端的显示 */
+                .q-tabs__content {
+                    flex-wrap: wrap !important;
+                }
+            }
+        </style>
+    ''')
     
     # 状态：当前选中的图片路径 (用于高亮标签)
     current_active_file = None 
@@ -634,7 +843,8 @@ def main_page():
 
     def show_full_image(f_path):
         """显示原图或视频预览"""
-        with ui.dialog() as d, ui.card().classes('w-full h-full max-w-none p-0 bg-black'):
+        # 使用 flex 居中布局，避免强制拉伸
+        with ui.dialog() as d, ui.card().classes('w-full h-full max-w-none p-0 bg-black flex items-center justify-center'):
             # Close button
             ui.button(icon='close', on_click=d.close).classes('absolute top-4 right-4 z-50 bg-black/50 text-white rounded-full hover:bg-black/80')
             
@@ -649,7 +859,9 @@ def main_page():
             if is_video(f_path):
                 ui.video(url_path).classes('w-full h-full').props('controls autoplay').style('object-fit: contain;')
             else:
-                ui.image(url_path).classes('w-full h-full object-contain')
+                # 使用 w-full h-full 确保占满容器，配合 fit=contain (Quasar prop) 和 object-fit: contain (CSS)
+                # 这样可以确保图片不被截断，且保持比例，多余部分显示背景色
+                ui.image(url_path).classes('w-full h-full').props('fit=contain').style('object-fit: contain;')
         d.open()
 
     def create_image_card(f_path):
@@ -660,9 +872,6 @@ def main_page():
         import time
         ts = int(time.time() * 1000)
         
-        # 如果文件不在缓存中，更新 ts
-        # 注意：这里我们只在初次加载或文件真正改变时才更新 ts
-        # refresh_gallery 会重建 UI，但我们希望保持 ts 不变，除非是 force 刷新
         if f_path not in state.file_timestamps:
             state.file_timestamps[f_path] = ts
         
@@ -675,51 +884,63 @@ def main_page():
         url_path = f'/datasets/{quote(rel_path)}?t={current_ts}'
         
         # 构建缩略图 URL (用于画廊显示)
-        # 注意：path 参数需要传递绝对路径
         thumb_url = f'/api/thumbnail?path={quote(f_path)}'
         
-        with ui.card().classes(f'w-full sm:w-48 md:w-56 lg:w-64 shrink-0 p-0 gap-0 rounded-lg shadow-sm hover:shadow-md transition-all bg-white {border_class} group') as card:
-            # 媒体预览
-            # 统一使用缩略图显示，避免大量视频标签导致 GPU OOM
-            # 视频支持原地播放 (Click-to-Play)，图片点击放大
-            with ui.element('div').classes('relative w-full aspect-square bg-gray-100') as media_wrapper:
-                def play_video_inplace():
-                    media_wrapper.clear()
-                    with media_wrapper:
-                        ui.video(url_path).classes('w-full h-full bg-black').props('controls autoplay').style('object-fit: contain;')
-
-                if is_video(f_path):
-                    ui.image(thumb_url).classes('w-full h-full object-cover').props('loading="lazy"')
-                    # Video Overlay: Play Icon
-                    ui.icon('play_circle_outline').classes('absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-white text-5xl opacity-80 group-hover:scale-110 transition-transform pointer-events-none drop-shadow-md')
-                    # Click Overlay
-                    ui.element('div').classes('absolute inset-0 cursor-pointer').on('click', play_video_inplace)
-                else:
-                    # Image Overlay: Zoom Icon
-                    ui.image(thumb_url).classes('w-full h-full object-cover').props('loading="lazy"')
-                    ui.icon('zoom_in').classes('absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-white text-4xl opacity-0 group-hover:opacity-80 transition-opacity pointer-events-none drop-shadow-md')
-                    # Click Overlay
-                    ui.element('div').classes('absolute inset-0 cursor-pointer').on('click', lambda: show_full_image(f_path))
+        # 优化移动端卡片宽度：PC w-64, 移动端 w-full (由父容器 grid 控制)
+        # 增加 group 类以便 hover
+        with ui.card().classes(f'w-full md:w-64 flex flex-col p-0 gap-0 relative group bg-white border shadow-sm transition-all hover:shadow-md {border_class}') as card:
+            # 存储 card 引用 (虽然这里还没有 checkbox 引用，稍后补充)
+            # 注意：旧逻辑是 state.card_refs[f_path] = {"txt": txt, "chk": chk, "card": card}
+            # 这里我们先不赋值，等构建完内部元素再赋值
             
-            with ui.column().classes('p-2 w-full gap-2'):
-                with ui.row().classes('w-full items-center justify-between'):
-                    ui.label(os.path.basename(f_path)[:15]+'...').classes('text-xs text-gray-500 truncate').props(f'title="{os.path.basename(f_path)}"')
-                    
-                    def on_chk(e, p=f_path, c=card):
-                        toggle_select(e.value, p)
-                        # 直接更新样式，不需要重建
-                        if e.value: c.classes(remove="border border-gray-200", add="border-2 border-blue-500")
-                        else: c.classes(remove="border-2 border-blue-500", add="border border-gray-200")
-                        # refresh_quick_tags() # 可选，实时更新标签高亮
-                    
-                    chk = ui.checkbox(on_change=lambda e: on_chk(e))
-                    chk.value = is_sel
+            # Selection overlay (checkbox)
+            # 移动端：保持显示，但稍微缩小
+            def on_chk_change(e):
+                 if e.value: 
+                     state.selected_files.add(f_path)
+                     card.classes(remove="border border-gray-200", add="border-2 border-blue-500")
+                 else: 
+                     state.selected_files.discard(f_path)
+                     card.classes(remove="border-2 border-blue-500", add="border border-gray-200")
+                 
+                 count = len(state.selected_files)
+                 selected_count_label.set_text(f"已选 {count}")
+                 ui_callbacks["refresh_details"]()
+
+            chk = ui.checkbox(value=is_sel, on_change=on_chk_change).classes('absolute top-0 right-0 z-10 bg-white/80 rounded-bl-lg transform scale-75 md:scale-100 m-1')
+            
+            # Image Area
+            # 移动端高度减小 h-20 (80px), PC h-48 (192px)
+            img = ui.image(thumb_url).classes('w-full h-20 md:h-48 object-cover cursor-pointer select-none').on('click', lambda: show_full_image(f_path))
+            
+            # Info Area
+            # 移动端：大幅简化，只显示文件名（截断），隐藏描述和标签
+            with ui.column().classes('w-full p-1 md:p-3 gap-0 md:gap-1'):
+                # Filename
+                ui.label(os.path.basename(f_path)).classes('text-[10px] md:text-sm font-bold truncate w-full leading-tight')
                 
-                cap_val = get_caption(f_path)
-                txt = ui.textarea(value=cap_val, on_change=lambda e: save_caption(f_path, e.value)).props('rows=3 borderless dense autogrow').classes('w-full text-xs bg-gray-50 rounded p-1')
-                
-                # 存储完整引用
-                state.card_refs[f_path] = {"txt": txt, "chk": chk, "card": card} 
+                # Caption Preview (PC only)
+                caption = get_caption(f_path)
+                if caption:
+                    ui.label(caption[:50] + '...' if len(caption)>50 else caption).classes('text-xs text-gray-600 line-clamp-2 break-all hidden md:block')
+                else:
+                    ui.label("未打标").classes('text-xs text-gray-400 italic hidden md:block')
+
+                # Tags (PC only)
+                tags = [t.strip() for t in caption.split(',') if t.strip()]
+                if tags:
+                    with ui.row().classes('gap-1 flex-wrap mt-1 hidden md:flex'):
+                        for t in tags[:3]:
+                            ui.label(t).classes('bg-blue-100 text-blue-800 text-[10px] px-1 rounded')
+                        if len(tags) > 3:
+                            ui.label(f"+{len(tags)-3}").classes('text-[10px] text-gray-400')
+            
+            # 存储完整引用以供 toggle_all 使用
+            state.card_refs[f_path] = {"chk": chk, "card": card}
+
+            # Tooltip
+            with ui.tooltip(f"{os.path.basename(f_path)}\n{caption}").classes('bg-gray-800 text-white text-xs'):
+                pass 
  
 
     def toggle_select(val, path):
@@ -1042,6 +1263,21 @@ def main_page():
                         if os.path.exists(txt_src):
                             txt_dest = os.path.splitext(dest_path)[0] + ".txt"
                             os.rename(txt_src, txt_dest)
+                
+                elif op == "清除打标 (Clear Tags)":
+                    # 清除打标逻辑：删除对应的 .txt 文件
+                    txt_path = get_caption_path(f)
+                    if os.path.exists(txt_path):
+                        try:
+                            os.remove(txt_path)
+                            count += 1
+                        except Exception as e:
+                            print(f"删除失败 {txt_path}: {e}")
+                    else:
+                        # 如果没有打标文件，也算处理成功（本来就没有）
+                        pass
+                    # 不需要处理图片，直接跳过后续的图片处理逻辑
+                    continue
                             
                 else:
                     # 图片处理操作 (Resize/Crop/Rotate/Convert)
@@ -1159,78 +1395,84 @@ def main_page():
             print(f"Batch Error: {e}")
 
     # --- 顶部导航栏 ---
-    with ui.header().classes('bg-white text-gray-800 border-b border-gray-200 h-20 px-4 flex items-center justify-between shadow-sm z-50'):
-        # Left: Title
-        with ui.row().classes('items-center gap-2'):
+    # 移动端优化：自动高度，允许换行，增加内边距
+    with ui.header().classes('bg-white text-gray-800 border-b border-gray-200 h-auto min-h-[3.5rem] py-1 px-2 md:px-4 flex flex-wrap items-center justify-between shadow-sm z-50 gap-y-1'):
+        # Left: Title (Order 1)
+        with ui.row().classes('items-center gap-1 md:gap-2 shrink-0 order-1'):
             ui.button(icon='menu', on_click=lambda: left_drawer.toggle()).classes('text-gray-600')
-            ui.icon('local_offer', size='md', color='blue-600')
+            ui.icon('local_offer', size='md', color='blue-600').classes('hidden md:block')
             with ui.column().classes('gap-0'):
-                ui.label('DocCaptioner').classes('text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-purple-600 leading-none')
-                ui.label('v1.0').classes('text-[10px] text-gray-400 leading-none')
+                ui.label('DocCaptioner').classes('text-sm md:text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-purple-600 leading-none')
+                ui.label('v1.1').classes('text-[8px] md:text-[10px] text-gray-400 leading-none')
 
-        # Right: Dataset & Actions
-        with ui.row().classes('items-center gap-4'):
-            # --- 性能监控 (New) ---
-            with ui.row().classes('items-center gap-3 mr-2 border-r pr-4 border-gray-300').bind_visibility_from(state.config, 'show_perf_monitor'):
-                 # CPU
-                with ui.row().classes('items-center gap-1'):
-                    ui.label('CPU').classes('text-xs font-bold text-black')
-                    with ui.element('div').classes('relative w-16 h-4 bg-gray-200 rounded overflow-hidden'):
-                        cpu_bar = ui.linear_progress(value=0, show_value=False).classes('absolute inset-0 h-full')
-                        cpu_label = ui.label('0%').classes('absolute inset-0 flex items-center justify-center text-[10px] font-bold text-black z-10')
-
-                # RAM
-                with ui.row().classes('items-center gap-1'):
-                    ui.label('RAM').classes('text-xs font-bold text-black')
-                    with ui.element('div').classes('relative w-16 h-4 bg-gray-200 rounded overflow-hidden'):
-                        ram_bar = ui.linear_progress(value=0, show_value=False).classes('absolute inset-0 h-full text-purple-500').props('color=purple')
-                        ram_label = ui.label('0%').classes('absolute inset-0 flex items-center justify-center text-[10px] font-bold text-black z-10')
-
-                # GPU
-                with ui.row().classes('items-center gap-1'):
-                    ui.label('GPU').classes('text-xs font-bold text-black')
-                    with ui.element('div').classes('relative w-16 h-4 bg-gray-200 rounded overflow-hidden'):
-                        gpu_bar = ui.linear_progress(value=0, show_value=False).classes('absolute inset-0 h-full text-green-500').props('color=green')
-                        gpu_label = ui.label('0%').classes('absolute inset-0 flex items-center justify-center text-[10px] font-bold text-black z-10')
-
-                # VRAM
-                with ui.row().classes('items-center gap-1'):
-                    ui.label('VRAM').classes('text-xs font-bold text-black')
-                    with ui.element('div').classes('relative w-16 h-4 bg-gray-200 rounded overflow-hidden'):
-                        vram_bar = ui.linear_progress(value=0, show_value=False).classes('absolute inset-0 h-full text-orange-500').props('color=orange')
-                        vram_label = ui.label('0%').classes('absolute inset-0 flex items-center justify-center text-[10px] font-bold text-black z-10')
-                
-                def update_perf_header():
-                    if not state.config.get("show_perf_monitor"): return
-                    s = get_system_stats()
-                    
-                    cpu_label.text = f"{s['cpu']}%"
-                    cpu_bar.value = s['cpu'] / 100.0
-                    
-                    ram_pct = int(s['ram_percent'])
-                    ram_label.text = f"{ram_pct}%"
-                    ram_bar.value = ram_pct / 100.0
-                    
-                    gpu_label.text = f"{s['gpu']}%"
-                    gpu_bar.value = s['gpu'] / 100.0
-                    
-                    vram_pct = s['vram_used'] / s['vram_total'] if s['vram_total'] > 0 else 0
-                    vram_label.text = f"{int(vram_pct*100)}%"
-                    vram_bar.value = vram_pct
-
-                ui.timer(2.0, update_perf_header)
-
+        # Selector & Actions (Order 2 on Mobile, Order 3 on Desktop)
+        # 移动端：放在 Title 右侧
+        with ui.row().classes('items-center gap-1 order-2 md:order-3 ml-auto md:ml-0'):
             # 数据集选择器美化
-            with ui.row().classes('items-center gap-1 bg-gray-100 rounded-lg px-2 py-1 border border-gray-200'):
-                ui.icon('folder_open', color='gray-500').classes('text-sm')
+            # 移动端：缩小选择器宽度 w-14
+            with ui.row().classes('items-center gap-1 bg-gray-100 rounded-lg px-1 md:px-2 py-1 border border-gray-200 shrink-0'):
+                ui.icon('folder_open', color='gray-500').classes('text-[10px] md:text-sm')
                 # 将 ds_select 存储在 state 中以便全局访问
+                # 移动端优化：缩小宽度 w-14 (56px), PC w-40 (160px)
+                # 缩小字体 text-[10px]
                 state.ds_select = ui.select(
                     options=[d for d in os.listdir(DATASET_ROOT) if os.path.isdir(os.path.join(DATASET_ROOT, d))],
                     value=os.path.basename(state.config["current_folder"]),
                     on_change=lambda e: change_dataset(e.value)
-                ).classes('w-40 text-sm').props('dense borderless options-dense behavior="menu"') # borderless 融入背景
+                ).classes('w-14 md:w-40 text-[10px] md:text-sm').props('dense borderless options-dense behavior="menu"') # borderless 融入背景
             
-            ui.button(icon='refresh', on_click=lambda: refresh_gallery(force=True)).props('flat round dense').classes('text-gray-600 hover:bg-gray-100')
+            ui.button(icon='refresh', on_click=lambda: refresh_gallery(force=True)).props('flat round dense').classes('text-gray-600 hover:bg-gray-100 shrink-0')
+
+        # Perf Monitor (Order 3 on Mobile, Order 2 on Desktop)
+        # 移动端：独占一行 (w-full)，居中显示
+        with ui.row().classes('items-center gap-1 md:gap-3 border-gray-300 order-3 md:order-2 w-full md:w-auto justify-center md:justify-end md:flex-1 md:border-r md:pr-4').bind_visibility_from(state.config, 'show_perf_monitor'):
+             # CPU
+            with ui.row().classes('items-center gap-0.5 md:gap-1 flex-nowrap'):
+                ui.label('CPU').classes('text-[8px] md:text-xs font-bold text-black whitespace-nowrap')
+                with ui.element('div').classes('relative w-8 md:w-16 h-3 md:h-4 bg-gray-200 rounded overflow-hidden shrink-0'): # 稍微放大宽度 w-6->w-8, h-2->h-3
+                    cpu_bar = ui.linear_progress(value=0, show_value=False).classes('absolute inset-0 h-full')
+                    cpu_label = ui.label('0%').classes('absolute inset-0 flex items-center justify-center text-[7px] md:text-[10px] font-bold text-black z-10')
+
+            # RAM
+            with ui.row().classes('items-center gap-0.5 md:gap-1 flex-nowrap'):
+                ui.label('RAM').classes('text-[8px] md:text-xs font-bold text-black whitespace-nowrap')
+                with ui.element('div').classes('relative w-8 md:w-16 h-3 md:h-4 bg-gray-200 rounded overflow-hidden shrink-0'):
+                    ram_bar = ui.linear_progress(value=0, show_value=False).classes('absolute inset-0 h-full text-purple-500').props('color=purple')
+                    ram_label = ui.label('0%').classes('absolute inset-0 flex items-center justify-center text-[7px] md:text-[10px] font-bold text-black z-10')
+
+            # GPU
+            with ui.row().classes('items-center gap-0.5 md:gap-1 flex-nowrap'):
+                ui.label('GPU').classes('text-[8px] md:text-xs font-bold text-black whitespace-nowrap')
+                with ui.element('div').classes('relative w-8 md:w-16 h-3 md:h-4 bg-gray-200 rounded overflow-hidden shrink-0'):
+                    gpu_bar = ui.linear_progress(value=0, show_value=False).classes('absolute inset-0 h-full text-green-500').props('color=green')
+                    gpu_label = ui.label('0%').classes('absolute inset-0 flex items-center justify-center text-[7px] md:text-[10px] font-bold text-black z-10')
+
+            # VRAM
+            with ui.row().classes('items-center gap-0.5 md:gap-1 flex-nowrap'):
+                ui.label('VRAM').classes('text-[8px] md:text-xs font-bold text-black whitespace-nowrap')
+                with ui.element('div').classes('relative w-8 md:w-16 h-3 md:h-4 bg-gray-200 rounded overflow-hidden shrink-0'):
+                    vram_bar = ui.linear_progress(value=0, show_value=False).classes('absolute inset-0 h-full text-orange-500').props('color=orange')
+                    vram_label = ui.label('0%').classes('absolute inset-0 flex items-center justify-center text-[7px] md:text-[10px] font-bold text-black z-10')
+            
+            def update_perf_header():
+                if not state.config.get("show_perf_monitor"): return
+                s = get_system_stats()
+                
+                cpu_label.text = f"{s['cpu']}%"
+                cpu_bar.value = s['cpu'] / 100.0
+                
+                ram_pct = int(s['ram_percent'])
+                ram_label.text = f"{ram_pct}%"
+                ram_bar.value = ram_pct / 100.0
+                
+                gpu_label.text = f"{s['gpu']}%"
+                gpu_bar.value = s['gpu'] / 100.0
+                
+                vram_pct = s['vram_used'] / s['vram_total'] if s['vram_total'] > 0 else 0
+                vram_label.text = f"{int(vram_pct*100)}%"
+                vram_bar.value = vram_pct
+
+            ui.timer(2.0, update_perf_header)
 
     # --- 左侧侧边栏 (标签 & 控制) ---
     with ui.left_drawer(value=True).classes('bg-gray-50 border-r border-gray-200 p-4 overflow-y-auto w-80') as left_drawer:
@@ -1324,11 +1566,13 @@ def main_page():
     # --- 主界面布局 (左侧画廊 + 右侧功能区) ---
     # 使用 calc(100vh - 5rem) 确保分割器高度固定为视口高度减去头部高度，避免整个页面滚动
     # 头部高度 h-20 对应 5rem
+    # responsive-splitter: 自定义 CSS 类，用于在移动端强制垂直布局
     with ui.splitter(value=state.config["splitter_value"], limits=(20, 80), 
-                     on_change=lambda e: update_config("splitter_value", e.value)).classes('w-full h-[calc(100vh-5rem)]') as splitter:
+                     on_change=lambda e: update_config("splitter_value", e.value)).classes('w-full h-[calc(100vh-5rem)] responsive-splitter') as splitter:
         
         # --- 左侧：画廊列表 (始终显示) ---
         with splitter.before:
+            # 增加 md:rounded-l-lg 等类名优化 PC 端圆角，移动端则不需要
             with ui.column().classes('w-full h-full bg-gray-100 overflow-y-auto'):
                 with ui.row().classes('w-full items-center justify-between sticky top-0 bg-gray-100 z-50 py-2 px-4 border-b border-gray-200'):
                     ui.label('📸 图片/视频列表').classes('text-lg font-bold text-gray-700')
@@ -1348,7 +1592,9 @@ def main_page():
                 # 使用 Flex 布局替代 Grid，实现更好的响应式
                 # gap-3: 间距
                 # justify-center: 居中对齐 (可选)
-                gallery_container = ui.row().classes('w-full gap-3 justify-center items-stretch p-4')
+                # 移动端优化：使用 grid 布局实现一行四列，gap 极小，w-full
+                # PC端：保持 flex wrap justify-center, w-64
+                gallery_container = ui.element('div').classes('w-full grid grid-cols-4 gap-1 p-1 md:flex md:flex-wrap md:gap-3 md:justify-center md:p-4')
                 
                 # 初始化：如果已有文件缓存，尝试立即渲染 (防止刷新后白屏)
                 # 注意：此时 ui.timer 尚未运行
@@ -1361,12 +1607,19 @@ def main_page():
         # --- 右侧：功能选项卡 ---
         with splitter.after:
             with ui.column().classes('w-full h-full p-0 gap-0 overflow-hidden'):
-                with ui.tabs().classes('w-full border-b border-gray-200 bg-white gap-2 justify-start pl-2 shrink-0') as tabs:
-                    tab_ai = ui.tab('AI 自动标注', icon='smart_toy')
-                    tab_batch = ui.tab('批量处理', icon='photo_library').classes('ml-2')
-                    tab_dataset = ui.tab('数据集', icon='folder_shared').classes('ml-2')
-                    tab_meta = ui.tab('详细信息', icon='info').classes('ml-2')
-                    tab_settings = ui.tab('设置', icon='settings').classes('ml-2')
+                # 移动端优化：Tabs 样式
+                # flex-wrap: 允许换行
+                # justify-center: 居中
+                # text-[10px]: 缩小字体
+                with ui.tabs().classes('w-full border-b border-gray-200 bg-white gap-1 md:gap-2 justify-between md:justify-start px-2 shrink-0') as tabs:
+                    # 移动端：图标在上，文字在下？或者只显示图标？
+                    # 暂时保持图标+文字，但缩小字体和内边距
+                    # 使用 flex-1 让它们平分宽度
+                    tab_ai = ui.tab('AI 自动标注', icon='smart_toy').classes('flex-1 text-[10px] md:text-sm px-1 min-h-[3rem]')
+                    tab_batch = ui.tab('批量处理', icon='photo_library').classes('flex-1 text-[10px] md:text-sm px-1 min-h-[3rem]')
+                    tab_dataset = ui.tab('数据集', icon='folder_shared').classes('flex-1 text-[10px] md:text-sm px-1 min-h-[3rem]')
+                    tab_meta = ui.tab('详细信息', icon='info').classes('flex-1 text-[10px] md:text-sm px-1 min-h-[3rem]')
+                    tab_settings = ui.tab('设置', icon='settings').classes('flex-1 text-[10px] md:text-sm px-1 min-h-[3rem]')
 
                 with ui.tab_panels(tabs, value=tab_ai).classes('w-full flex-grow overflow-hidden p-0 bg-white'):
                     
@@ -1376,60 +1629,137 @@ def main_page():
                         
                         with ui.card().classes('w-full p-4 bg-gray-50 border'):
                             ui.label('模型配置').classes('font-bold text-gray-700 mb-2')
-                            with ui.row().classes('w-full gap-4'):
+                        with ui.card().classes('w-full p-4 bg-gray-50 border'):
+                            ui.label('模型配置').classes('font-bold text-gray-700 mb-2')
+                            
+                            # Row 1: Source + Model Select/Path/URL (Top Line)
+                            with ui.row().classes('w-full gap-4 items-start'):
                                 ui.select(["预设模型 (Preset)", "在线 API (OpenAI Compatible)", "本地路径 (Local Path)"], 
                                         value=state.config["source_type"], label="来源",
                                         on_change=lambda e: update_config("source_type", e.value)).classes('w-1/3')
                                 
-                                # 动态配置区域
-                                config_area = ui.row().classes('flex-1 gap-4')
-                                def render_ai_config():
-                                    config_area.clear()
-                                    with config_area:
-                                        if state.config["source_type"] == "预设模型 (Preset)":
-                                            ui.select(list(KNOWN_MODELS.keys()), value=state.config["selected_model_key"],
-                                                    label="选择模型", on_change=lambda e: update_config("selected_model_key", e.value)).classes('flex-1')
-                                            ui.checkbox("完成后卸载", value=state.config["unload_model"],
-                                                    on_change=lambda e: update_config("unload_model", e.value)).classes('mt-2')
-                                        elif state.config["source_type"] == "本地路径 (Local Path)":
-                                            ui.input("模型路径 (文件夹或 .gguf)", value=state.config.get("local_model_path", ""),
-                                                    on_change=lambda e: update_config("local_model_path", e.value)).classes('flex-1')
-                                            ui.checkbox("完成后卸载", value=state.config["unload_model"],
-                                                    on_change=lambda e: update_config("unload_model", e.value)).classes('mt-2')
-                                        else:
-                                            ui.input("API Base URL", value=state.config["api_base_url"],
-                                                    on_change=lambda e: update_config("api_base_url", e.value)).classes('flex-1')
-                                            ui.input("API Key", password=True, value=state.config["api_key"],
-                                                    on_change=lambda e: update_config("api_key", e.value)).classes('flex-1')
-                                            ui.input("Model Name", value=state.config["api_model_name"],
-                                                    on_change=lambda e: update_config("api_model_name", e.value)).classes('w-32')
-                                            
-                                            def test_api():
-                                                api_base = state.config["api_base_url"].rstrip("/")
-                                                if api_base.endswith("/chat/completions"):
-                                                    api_url = api_base
-                                                else:
-                                                    api_url = f"{api_base}/chat/completions"
-                                                
-                                                ui.notify(f"正在测试: {api_url} ...", type="info")
-                                                try:
-                                                    # 发送一个极简的请求
-                                                    headers = {"Authorization": f"Bearer {state.config['api_key']}", "Content-Type": "application/json"}
-                                                    payload = {
-                                                        "model": state.config["api_model_name"],
-                                                        "messages": [{"role": "user", "content": "test"}],
-                                                        "max_tokens": 5
-                                                    }
-                                                    resp = requests.post(api_url, headers=headers, json=payload, timeout=10)
-                                                    if resp.status_code == 200:
-                                                        ui.notify("✅ 连接成功!", type="positive")
-                                                    else:
-                                                        ui.notify(f"❌ 失败 [{resp.status_code}]: {resp.text[:100]}", type="negative", close_button=True, multi_line=True)
-                                                except Exception as e:
-                                                    ui.notify(f"❌ 异常: {e}", type="negative", close_button=True)
+                                # 动态配置区域 1 (Model Select / API URL)
+                                config_area_1 = ui.row().classes('flex-1 gap-4 items-center')
+                            
+                            # Row 2: Options / API Key (Bottom Line)
+                            config_area_2 = ui.row().classes('w-full gap-4 items-center mt-2')
 
-                                            ui.button("🔗 测试", on_click=test_api).classes('w-auto px-3 whitespace-nowrap')
-                                render_ai_config()
+                            def render_ai_config():
+                                config_area_1.clear()
+                                config_area_2.clear()
+                                
+                                if state.config["source_type"] == "预设模型 (Preset)":
+                                    # Row 1 Right: Model Select
+                                    with config_area_1:
+                                        ui.select(list(KNOWN_MODELS.keys()), value=state.config["selected_model_key"],
+                                                label="选择模型", on_change=lambda e: update_config("selected_model_key", e.value)).classes('w-full')
+                                    
+                                    # Row 2 Full: Options
+                                    with config_area_2:
+                                        # VRAM Optimization Checkbox (Left)
+                                        vram_opt_chk = ui.checkbox("显存优化 (CPU Offload)", value=state.config.get("vram_optimization", False),
+                                            on_change=lambda e: update_config("vram_optimization", e.value))
+                                        
+                                        # Spacer
+                                        ui.space()
+
+                                        # Quantization Setting (Right)
+                                        q_select = ui.select(["None", "4-bit", "8-bit"], value=state.config.get("quantization", "None"),
+                                                label="量化 (Quantization)", 
+                                                on_change=lambda e: update_config("quantization", e.value)).classes('w-32').props('dense options-dense')
+                                        
+                                        # Unload Checkbox (Far Right)
+                                        ui.checkbox("完成后卸载", value=state.config["unload_model"],
+                                                on_change=lambda e: update_config("unload_model", e.value))
+
+                                        # 绑定可见性逻辑
+                                        def update_vram_opt_visibility(e=None):
+                                            val = q_select.value if e is None else e.value
+                                            if val == "None":
+                                                # 显示时，移除 hidden 和 invisible
+                                                vram_opt_chk.classes(remove="hidden invisible")
+                                            else:
+                                                # 隐藏时，使用 invisible 保持占位（如果想要左边空白）
+                                                # 或者使用 hidden（如果想要完全隐藏，这里用 hidden 可能更好，因为是新的一行）
+                                                # 但为了保持布局稳定，invisible 也可以
+                                                vram_opt_chk.classes(add="invisible") 
+                                                vram_opt_chk.classes(remove="hidden")
+                                        
+                                        q_select.on_value_change(update_vram_opt_visibility)
+                                        update_vram_opt_visibility()
+
+                                elif state.config["source_type"] == "本地路径 (Local Path)":
+                                    # Row 1 Right: Model Path Input
+                                    with config_area_1:
+                                        ui.input("模型路径 (文件夹或 .gguf)", value=state.config.get("local_model_path", ""),
+                                                on_change=lambda e: update_config("local_model_path", e.value)).classes('w-full')
+                                    
+                                    # Row 2 Full: Options
+                                    with config_area_2:
+                                        vram_opt_chk = ui.checkbox("显存优化 (CPU Offload)", value=state.config.get("vram_optimization", False),
+                                            on_change=lambda e: update_config("vram_optimization", e.value))
+                                        
+                                        ui.space()
+                                        
+                                        q_select = ui.select(["None", "4-bit", "8-bit"], value=state.config.get("quantization", "None"),
+                                                label="量化 (Quantization)", 
+                                                on_change=lambda e: update_config("quantization", e.value)).classes('w-32').props('dense options-dense')
+                                        
+                                        ui.checkbox("完成后卸载", value=state.config["unload_model"],
+                                                on_change=lambda e: update_config("unload_model", e.value))
+
+                                        # 绑定可见性逻辑
+                                        def update_vram_opt_visibility(e=None):
+                                            val = q_select.value if e is None else e.value
+                                            if val == "None":
+                                                vram_opt_chk.classes(remove="hidden invisible")
+                                            else:
+                                                vram_opt_chk.classes(add="invisible")
+                                                vram_opt_chk.classes(remove="hidden")
+
+                                        q_select.on_value_change(update_vram_opt_visibility)
+                                        update_vram_opt_visibility()
+
+                                else: # API
+                                    # Row 1 Right: API Base URL
+                                    with config_area_1:
+                                        ui.input("API Base URL", value=state.config["api_base_url"],
+                                                on_change=lambda e: update_config("api_base_url", e.value)).classes('w-full')
+                                    
+                                    # Row 2 Full: API Key + Model + Test
+                                    with config_area_2:
+                                        ui.input("API Key", password=True, value=state.config["api_key"],
+                                                on_change=lambda e: update_config("api_key", e.value)).classes('flex-1')
+                                        ui.input("Model Name", value=state.config["api_model_name"],
+                                                on_change=lambda e: update_config("api_model_name", e.value)).classes('w-32')
+                                        
+                                        def test_api():
+                                            api_base = state.config["api_base_url"].rstrip("/")
+                                            if api_base.endswith("/chat/completions"):
+                                                api_url = api_base
+                                            else:
+                                                api_url = f"{api_base}/chat/completions"
+                                            
+                                            ui.notify(f"正在测试: {api_url} ...", type="info")
+                                            try:
+                                                # 发送一个极简的请求
+                                                headers = {"Authorization": f"Bearer {state.config['api_key']}", "Content-Type": "application/json"}
+                                                payload = {
+                                                    "model": state.config["api_model_name"],
+                                                    "messages": [{"role": "user", "content": "test"}],
+                                                    "max_tokens": 5
+                                                }
+                                                resp = requests.post(api_url, headers=headers, json=payload, timeout=10)
+                                                if resp.status_code == 200:
+                                                    ui.notify("✅ 连接成功!", type="positive")
+                                                else:
+                                                    ui.notify(f"❌ 失败 [{resp.status_code}]: {resp.text[:100]}", type="negative", close_button=True, multi_line=True)
+                                            except Exception as e:
+                                                ui.notify(f"❌ 异常: {e}", type="negative", close_button=True)
+
+                                        ui.button("🔗 测试", on_click=test_api).classes('w-auto px-3 whitespace-nowrap')
+                                        
+                            render_ai_config()
 
                         with ui.card().classes('w-full p-4 bg-gray-50 border'):
                             ui.label('提示词 (Prompt)').classes('font-bold text-gray-700 mb-2')
@@ -1567,7 +1897,7 @@ def main_page():
                             
                             ui.label('选择操作').classes('text-sm text-gray-500 mb-1')
                             operation = ui.select(
-                                options=["转换格式 (Convert)", "调整大小 (Resize)", "旋转 (Rotate)", "裁剪 (Crop)", "顺序重命名 (Rename)"],
+                                options=["转换格式 (Convert)", "调整大小 (Resize)", "旋转 (Rotate)", "裁剪 (Crop)", "顺序重命名 (Rename)", "清除打标 (Clear Tags)"],
                                 value="转换格式 (Convert)",
                                 on_change=lambda e: update_batch_ui(e.value)
                             ).classes('w-full border rounded mb-4 text-lg')
@@ -1629,6 +1959,7 @@ def main_page():
                                 rotate_params.set_visibility(op == "旋转 (Rotate)")
                                 crop_params.set_visibility(op == "裁剪 (Crop)")
                                 rename_params.set_visibility(op == "顺序重命名 (Rename)")
+                                # 清除打标不需要额外参数，所以没有对应的 set_visibility
                             
                             # 初始化一次
                             # 使用 lambda 确保 operation 存在且可访问
@@ -1647,8 +1978,21 @@ def main_page():
                             output_new_folder_chk.on_value_change(lambda e: toggle_folder_input(e))
                             
                             def trigger_batch_process():
-                                # 包装一下以传递正确的 UI 状态
-                                start_batch_process()
+                                op = operation.value
+                                # 检查是否是清除打标操作，如果是，则弹出确认对话框
+                                if op == "清除打标 (Clear Tags)":
+                                    with ui.dialog() as d, ui.card():
+                                        ui.label('⚠️ 警告').classes('text-lg font-bold text-red-600')
+                                        ui.label('确定要清除选中图片的打标信息吗？此操作不可撤销。')
+                                        with ui.row().classes('w-full justify-end mt-4'):
+                                            ui.button('取消', on_click=d.close).props('flat')
+                                            def confirm_clear():
+                                                d.close()
+                                                start_batch_process()
+                                            ui.button('确定清除', on_click=confirm_clear).classes('bg-red-600 text-white')
+                                    d.open()
+                                else:
+                                    start_batch_process()
                                 
                             ui.button('▶ 执行批量处理', on_click=trigger_batch_process).classes(BTN_PRIMARY + ' w-full h-12 text-lg shadow-md')
 
@@ -2173,4 +2517,4 @@ def main_page():
     # ui.timer(0.5, update_ui_loop) # Removed duplicate timer to save resources
     ui.timer(0.1, refresh_gallery, once=True)
 
-ui.run(title="DocCaptioner v1.0", host="127.0.0.1", port=9090, reload=True, dark=False, storage_secret="secret")
+ui.run(title="DocCaptioner v1.1", host="127.0.0.1", port=9090, reload=True, dark=False, storage_secret="secret")

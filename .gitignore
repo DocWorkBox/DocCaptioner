@@ -23,3 +23,7 @@ thumbnails/
 .trae/
 check_code.py
 run.log
+
+# Build Artifacts
+DocCaptioner_Portable/
+python_embed.zip
