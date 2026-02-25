@@ -12,7 +12,7 @@ GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 BASE_DIR = os.getcwd()
 BUILD_DIR = os.path.join(BASE_DIR, "DocCaptioner_Portable")
 PYTHON_DIR = os.path.join(BUILD_DIR, "python")
-PROJECT_FILES = ["web_app_ng.py", "requirements.txt", "README.md", ".gitignore", "models"]
+PROJECT_FILES = ["web_app_ng.py", "requirements.txt", "README.md", ".gitignore", "models", "app", "ui"]
 
 def log(msg):
     print(f"[构建] {msg}")

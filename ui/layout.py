@@ -839,7 +839,7 @@ def create_ui():
                 # flex-wrap: 允许换行
                 # justify-center: 居中
                 # text-[10px]: 缩小字体
-                with ui.tabs().classes('w-full border-b border-gray-200 bg-white gap-1 md:gap-2 justify-between md:justify-start px-2 shrink-0') as tabs:
+                with ui.tabs(value='tab_ai', on_change=lambda e: None).classes('w-full border-b border-gray-200 bg-white gap-1 md:gap-2 justify-between md:justify-start px-2 shrink-0') as tabs:
                     # 移动端：图标在上，文字在下？或者只显示图标？
                     # 暂时保持图标+文字，但缩小字体和内边距
                     # 使用 flex-1 让它们平分宽度
@@ -1778,4 +1778,7 @@ def create_ui():
 
     # ui.timer(0.5, update_ui_loop) # Removed duplicate timer to save resources
     ui.timer(0.1, refresh_gallery, once=True)
+    
+    # 强制设置初始 tab，触发 visibility bind 更新
+    ui.timer(0.1, lambda: tabs.set_value('tab_ai'), once=True)
 
