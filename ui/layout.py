@@ -143,7 +143,7 @@ def create_ui():
             # 移动端：大幅简化，只显示文件名（截断），隐藏描述和标签
             with ui.column().classes('w-full p-1 md:p-3 gap-0 md:gap-1'):
                 # Filename
-                ui.label(os.path.basename(f_path)).classes('text-[10px] md:text-sm font-bold truncate w-full leading-tight')
+                ui.label(os.path.basename(f_path)).classes('text-xs md:text-sm font-bold truncate w-full leading-tight')
                 
                 # Caption Editable Area
                 caption = get_caption(f_path)
@@ -151,8 +151,8 @@ def create_ui():
                 # autogrow: 自动高度
                 # debounce=1000: 防抖，停止输入1秒后保存，减少IO
                 txt = ui.textarea(value=caption, on_change=lambda e, f=f_path: save_caption(f, e.value)) \
-                    .props('borderless dense autogrow rows=1 debounce=1000') \
-                    .classes('w-full text-[8px] md:text-xs bg-gray-50 rounded px-1 leading-tight min-h-[1.5em] max-h-[4em] md:max-h-[6em] overflow-hidden')
+                    .props('borderless dense rows=3 debounce=1000 input-style="max-height: 120px; overflow-y: auto; resize: none;"') \
+                    .classes('w-full text-xs bg-gray-50 rounded px-1 py-1 leading-tight min-h-[2em]')
 
                 # Tags (PC only - 移动端隐藏以节省空间)
                 tags = [t.strip() for t in caption.split(',') if t.strip()]
