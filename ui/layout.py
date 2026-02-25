@@ -643,9 +643,28 @@ def create_ui():
                 # 将 ds_select 存储在 state 中以便全局访问
                 # 移动端优化：缩小宽度 w-14 (56px), PC w-40 (160px)
                 # 缩小字体 text-[10px]
+                # Safe dataset selector initialization
+                ds_options = [d for d in os.listdir(DATASET_ROOT) if os.path.isdir(os.path.join(DATASET_ROOT, d))]
+                current_ds_name = os.path.basename(state.config.get("current_folder", ""))
+                
+                # Auto-create Default if empty
+                if not ds_options:
+                    default_path = os.path.join(DATASET_ROOT, "Default")
+                    if not os.path.exists(default_path):
+                        os.makedirs(default_path, exist_ok=True)
+                    ds_options = ["Default"]
+                    current_ds_name = "Default"
+                    state.config["current_folder"] = default_path
+                
+                # Fallback if current selection invalid
+                if current_ds_name not in ds_options:
+                    current_ds_name = ds_options[0] if ds_options else None
+                    if current_ds_name:
+                         state.config["current_folder"] = os.path.join(DATASET_ROOT, current_ds_name)
+
                 state.ds_select = ui.select(
-                    options=[d for d in os.listdir(DATASET_ROOT) if os.path.isdir(os.path.join(DATASET_ROOT, d))],
-                    value=os.path.basename(state.config["current_folder"]),
+                    options=ds_options,
+                    value=current_ds_name,
                     on_change=lambda e: change_dataset(e.value)
                 ).classes('w-14 md:w-40 text-[10px] md:text-sm').props('dense borderless options-dense behavior="menu"') # borderless 融入背景
             
