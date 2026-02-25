@@ -1,4 +1,4 @@
-# DocCaptioner v1.1
+tu'kutuku# DocCaptioner v1.1
 
 **DocCaptioner** 是一款基于 NiceGUI 构建的现代化本地图像/视频打标与数据集管理工具。它集成了先进的 **Qwen 3-VL** (Vision-Language) 视觉大模型，旨在为 AI 训练提供高效、流畅的“工作室级”数据准备工作流。
 
